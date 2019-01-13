@@ -1,0 +1,320 @@
+#!/usr/bin/perl -w
+#извлечение и препарирование отчетов
+
+use strict;
+
+use Avtobus::MSMCmd;
+
+my %frm = ( QWIN => 1, Name => 2, Suff => 3, Title => 4 ); 
+my %var = ( Name => 1, Val => 2, Expr => 3 ); 
+my %dat = ( Name => 1, POut => 2,  PIn => 3 ); 
+my %run = ( Exec => 1); 
+
+my $STD = '/var/tmp/REPORT-MAKER.std';
+
+my %T = (                #параметры запуска по умолчанию
+        'ITOG'  => ['Var', 'ITOG'  , 1     ],
+        '%qtlk' => ['Var', '%qtlk' , 0     ],
+        '%MXWT' => ['Var', '%MXWT' , 10000 ],
+        '%MXLN' => ['Var', '%MXLN' , 10000 ],
+        'DEV'   => ['Var', 'DEV'   , '$i'  ],
+        'K'     => ['Var', 'K'     , '$i'  ],
+        'I'     => ['Var', 'I'     , 1     ],
+        'Format'=> ['Var', 'Format', '1,2' ]
+);
+my @Itog  = ('Dat', '',  0,  0); #колонка итогов
+my @Colon = ('Dat', "\2!",  1,  1);#колонка колонтитулов
+
+
+use IO::Socket;
+
+use Getopt::Long;
+my %opt; GetOptions(\%opt,'I','w=s','s=s','u=s','t=s','a=i','d=i');    
+                        # s - исходное (стандартное) описание формы 
+                        # u - пользовательские настройки
+                        # t - типовая настройка всех форм    
+                        # a - игнорировать список колонок вывода (выводить все)
+                        # d - MSM debug
+use File::Basename;
+sub usage{
+my $n = basename($0);
+print STDERR <<txt
+usage:
+
+$n ( -u User ) | ( -I ) [-s Sourse] [-t Type] User User ...
+where :
+      Sourse - File of definition default value to print form
+      Type   - File of definition specific to type of request (all form)
+      User   - File of definition list forms to print (with specific value)
+      -I Read UserFile(s) from STDIN
+  перекодировка     
+      -w d вывести в кодировке DOS (866)
+      -w w вывести в кодировке Windows (1251)
+  отладка    
+      -a 0 игнорировать список колонок вывода
+      -a 1 выводить данные по списку колонок вывода и "сырые" данные
+      -d включить MSM отладку (1 - без выполнения команды MSM)
+txt
+}                        
+
+(local $,=', ', print "User files :",@ARGV,"\n") if $opt{d};
+                #все параметры передали ?
+(usage(),exit 1) if not exists $opt{u} 
+                and not exists $opt{I}
+                and @ARGV < 1 ;
+$opt{'s'} = $STD unless $opt{'s'};        #файл типовой настройки
+                                               #список переданных параметров
+if ($opt{d}){for my $i (keys %opt){print "$i = $opt{$i}\n";} };
+push(@ARGV,'-') if $opt{I} and not scalar @ARGV ;
+$opt{w} = '' unless $opt{w} ;
+#for my $i (@ARGV){print ">=$i\n"};
+
+#-------------- разбор параметров -----------------------------
+my @File; my $Err = 0;
+my %s ;my %u ;my %t ;
+
+for my $i (qw(s u t)){        #разбираем какие опциональные файлы переданы
+        if ($opt{$i}){
+#print "file = $opt{$i}\n";
+                open(DAT,"<$opt{$i}")  
+                        || (MsgToWebmaster("Cant open file $opt{$i} : $! ",$i),$Err++,next);
+                @File = ();
+                while (<DAT>){           
+                    next if /^#/; next unless /;/;
+                    chomp ; tr/\r//d ; next unless $_;
+                    next if /^\s*;/ ;
+                    push (@File, $_);
+                }                          # прогоняем их через парсер
+                                           # только указанного типа
+#print "\n$i\n",@File,"\n";
+                %s = ParseParametr(\%s,\@File,'s') if $i eq 's';
+                %u = ParseParametr(\%u,\@File,'u') if $i eq 'u';
+                %t = ParseParametr(\%t,\@File,'t') if $i eq 't';
+        }
+}
+
+@File = ();
+if (scalar @ARGV){
+    while (<>){                #тепереь вычитываем все переданные файлы (в т.ч. stdin)
+        next if /^#/; next unless /;/;
+        chomp ; tr/\r//d ; next unless $_;
+        next if /^\s*;/ ;
+        push (@File, $_);
+    }                          #и прогоняем их через парсеры по всем типам
+}    
+#print @File;
+%s = ParseParametr(\%s,\@File,'s') ;
+%u = ParseParametr(\%u,\@File,'u') ;
+%t = ParseParametr(\%t,\@File,'t') ;
+
+for my $i (keys %T){           #доопределяем необходимые умолчаний
+        $t{'Frm;All'}->{Var}->{$i} = $T{$i} unless exists $t{'Frm;All'}->{Var}->{$i};
+}
+
+$opt{d} = 1 if $Err;        #т.е. запрещаем обращение к серверу при наличии ошибок обработки параметров
+
+#----------------- цикл вывода форм ---------------------
+for my $i (sort keys %u){    #по всем заданным пользователем определениям
+#print "$i\n";
+    my %v; 
+    my %d = ( $Itog[$dat{Name}] => \@Itog , $Colon[$dat{Name}] => \@Colon) ;
+        $d{$Itog[$dat{Name}]}->[$dat{Name}] = ' ' . $s{$i}->{Frm}->[$frm{Name}];
+    MsgToWebmaster("Form %i not defined in this system $! ",$_[0]) if not exists $s{$i} ;
+    for my $j (keys %{$s{$i}->{Var}}){
+        $v{$j} = CalcParametr( $s{$i}->{Var}->{$j} ) ;  #источник 
+#        print "$i $j, $v{$j} \n";
+    }    
+    for my $j (keys %{$s{$i}->{Dat}}){   #колонки вывода
+        $d{$j} = $s{$i}->{Dat}->{$j}  ;  #источник 
+#        print "$i $j, $d{$j} \n";
+    }    
+    for my $j (keys %{$t{'Frm;All'}->{Var}}){                  
+        $v{$j} = CalcParametr( $t{'Frm;All'}->{Var}->{$j} ) ;  #типовая настройка
+#        print "$i $j, $v{$j} \n";
+    }    
+    for my $j (keys %{$t{'Frm;All'}->{Dat}}){  #колонки вывода
+        $d{$j} = $t{'Frm;All'}->{Dat}->{$j} ;  #типовая настройка
+#        print "$i $j, @{$d{$j}} \n";
+    }    
+    for my $j (keys %{$u{$i}->{Var}}){                  
+        $v{$j} = CalcParametr( $u{$i}->{Var}->{$j} ) ;  #пользовательские определения 
+#        print "$i $j, $v{$j} \n";
+    }    
+    for my $j (keys %{$u{$i}->{Dat}}){   #колонки вывода               
+        $d{$j} = $u{$i}->{Dat}->{$j}  ;  #пользовательские определения 
+#        print "$i $j, $d{$j} \n";
+    }    
+    
+    $v{'%'} = "\"$s{$i}->{Frm}->[$frm{Name}]\""; #Передаем имя формы
+    
+    my %o;        #оптимизация присвоений - сортируем по значениям
+    for my $i (keys %v){
+        next if $i =~ /^QW/ ;
+        next if $i =~ /^RG$/ ;        
+        push(@{$o{$v{$i}}},$i);
+    }
+    my $s = 's ';    #теперь для одинаковых значений формируем списки присвоения
+    for my $i (sort keys %o){
+#        print "$i = @{$o{$i}} \n";
+        if ( scalar @{$o{$i}} > 1){
+            $s .= '(' . join(',', @{$o{$i}} ) . ')=' . $i . ',';
+        } else {
+            $s .= "$o{$i}->[0]=$i,";
+        }
+    }
+    # наведение красоты на командную строку
+    chop $s;        #последняя запятая
+    if ( $s{$i}->{Run}->[$run{Exec}] =~ /\$/ ){
+        $s{$i}->{Run}->[$run{Exec}] = 'i ' . $s{$i}->{Run}->[$run{Exec}] ;
+    } else {
+        $s{$i}->{Run}->[$run{Exec}] = 'd ' . $s{$i}->{Run}->[$run{Exec}] ;
+    }
+
+    print "$s $s{$i}->{Run}->[$run{Exec}]\n\n" if exists $opt{d};
+
+#-------------------запрос данных от MSM-------------------------    
+use Fcntl qw(:DEFAULT :flock);
+my $cnt;
+   unless ($opt{d}){
+                                #синхронизация
+   open(LOCK,'>/tmp/5050.lock');
+   flock(LOCK,LOCK_EX) ; print LOCK "$$\n";
+   unlink('/tmp/5050.lock');
+   
+      $cnt = IO::Socket::INET->new(Proto => "tcp",PeerAddr => "localhost",PeerPort => '5050', Timeout => 10) 
+			|| return;        $cnt->autoflush(1);        
+    # и НАКОНЕЦ исполнение
+      print $cnt &CmdMsm("$s $s{$i}->{Run}->[$run{Exec}]") ;
+    } else {next}
+
+                        #обработка и вывод отчета
+    my $head ; my @d; my @s = ('','');
+    while ( <$cnt> ) {
+        next if /\x1B\[/;        #некоторые искалки злонамеренно выводят текст
+        chomp ; 
+        tr/\r//d ; next unless $_;
+        if (exists $opt{a}) { print (dostokoi($_),"\n"); next unless $opt{a}; };
+        unless ($head){        #первая значимая строка с именами колонок ?
+                               #построим шаблон вывода
+               @d = BuildColumnList( $head = dostokoi($_), \%d ); 
+               print shift @d,"\n" unless $opt{w};
+               print koitodos(shift @d),"\n" if $opt{w} eq 'd';
+               print koitowin(shift @d),"\n" if $opt{w} eq 'w';
+               next;
+        }
+        my @k = split(';',dostokoi($_)) ;  my @j = @s ;
+        for my $i (@d){        #обрабатываем список колонок вывода
+                my $s = '';
+                $s = $k[$i->[$dat{PIn}]] if defined $k[$i->[$dat{PIn}]];
+                $s =~ tr/,/./ if $s=~ /^[-+]?\d+,\d+$/ ;
+                $s =~ tr/;/_/;
+                if ($i->[$dat{PIn}] < 2) {        #колонтитул|прерыватель
+                        $j[$i->[$dat{POut}]] = $s if $s; next;
+                } else {push @j,$s ; next ; }     #все прочее
+                
+        }
+        if (scalar @k < 3){ @s=(@j[0,1]); next } else { @s = ('',$j[1]) }
+        if (scalar @j){
+                print join(";",@j),";\n" unless $opt{w};
+                print koitodos(join(";",@j)),"\n" if $opt{w} eq 'd';
+                print koitowin(join(";",@j)),"\n" if $opt{w} eq 'w';
+        }
+    }  
+    close($cnt);
+}
+
+exit 0;
+
+#-----------вспомогательные функции----------------------------
+sub ParseParametr{
+my $ret =shift ;
+my $file=shift ;
+my $type=shift ;
+    my %ret = %{$ret}; my $st = 'End'; my $name = ''; my $ty = '';
+    for (@{$file}){
+        next if /^#/; next unless /;/;
+        chomp ; tr/\r//d ; next unless $_;
+        my @s = split(";"); next unless $s[0];
+        if ($st eq 'End'){
+            if ($s[0] eq 'Idn'){    #в состоянии End допустимо только Idn & Typ
+#print "$_ $type >$ty<\n" if $type eq 'u';
+                next if $ty && $ty ne $type ; #пропуск типа, недопустмого в этом контексте
+                $st = $s[0] ; $name = '' ; next ;
+            } elsif ($s[0] eq 'Typ'){         #задан новый тип данных
+                $ty = $s[1] ; next ;
+            } else {next ;}        #все остальное отбрасывается
+        } elsif ($st eq 'Idn'){
+            if ($s[0] eq 'tRP'){    #убить узел и сделать откат
+                delete($ret{$name}) if $name;
+                $st = 'End' ; $name = '' ; next ;
+            } elsif ($s[0] eq 'Frm'){    #имя новой формы
+                pop(@s);
+                $name = join(';',@s);
+                $ret{$name}->{Frm} = \@s;
+                next ;
+            }  elsif ($s[0] eq 'End'){  
+                $st = $s[0] ; $name = '' ; next ;
+            }elsif ($name){
+                $ret{$name}->{Run} = \@s if $s[0] eq 'Run';
+                $ret{$name}->{Var}->{$s[$var{Name}]} = \@s if $s[0] eq 'Var';
+                $ret{$name}->{Dat}->{$s[$dat{Name}]} = \@s if $s[0] eq 'Dat';
+#                print $_," $name\n"; 
+                next;
+            } else {MsgToWebmaster("Error Parse : ","<$_>","Stat=$st");$Err++}
+        } else {    
+            MsgToWebmaster("Error format file : ","<$_>");$Err++;
+            $st = 'End' ; next;
+        }
+    }
+return %ret;    
+}
+
+
+
+sub BuildColumnList{
+my $head = shift;
+my $d = shift;
+my $ret = '';        #заголовочная строка наименований колонок
+    my %head ; my $k = 0; my @d;
+    if (scalar ( keys %{$d} ) == 2){        #не заданы колонки вообще
+        my @h =  split(';',$head);
+        for ($k=2;$k<=$#h;$k++){my $j = $h[$k];
+            $head{$j}->[0] = 'Dat' ;
+            $head{$j}->[$dat{PIn}] = $k ;
+            $head{$j}->[$dat{POut}] = $k;
+            $head{$j}->[$dat{Name}] = $j;
+        }
+    } else {                                #колонки заданы - только доопределить недостающее
+        for my $j ( (split(';',$head)) ){
+            if ( exists $d->{$j} ){         #определение позиций по именам
+                $head{$j}=$d->{$j} ;
+                $head{$j}->[$dat{PIn}] = $k if not defined $head{$j}->[$dat{PIn}] ;
+            }
+            $k++;
+        };
+    }
+    for my $i (keys %{$d}){                #копирование позиций если они заданы
+                                           #(для случаев переопределения имен)
+        $head{$i} = $d->{$i} if defined $d->{$i}->[$dat{PIn}] ;
+    }        
+    for my $i (sort         #окончательно формирование картины вывода
+                            #(сортировка по номерам вывода и именам колонок)
+        { sprintf('%03d',$head{$a}->[$dat{POut}]) . $head{$a}->[$dat{Name}]
+         cmp
+         sprintf('%03d',$head{$b}->[$dat{POut}]) . $head{$b}->[$dat{Name}]
+        } 
+        keys %head)
+        { push(@d,$head{$i}); $ret .= "$head{$i}->[$dat{Name}];" ;
+    }
+return ($ret,@d);                
+}
+
+sub CalcParametr{
+my $p = shift;
+    $p = $p->[$var{Val}] ;
+    $p = '' if not defined $p  ;
+    $p =~ s/"/""/g unless $p =~ /^\$/;
+    $p = "\"$p\"" unless $p =~ /(^[1-9]\d*$)|(^[0-9]$)|(^\$)/ ;
+return $p
+}
+

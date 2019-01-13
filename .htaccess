@@ -1,0 +1,5 @@
+AddCharset UTF-8 .html
+AuthType Basic
+AuthName "report"
+AuthUserFile /var/vpi_report/.htpasswd
+Require valid-user
