@@ -106,6 +106,7 @@ def main():
 
     printSorted(result, dateBgn, dateEnd)
 
+
 if __name__ == '__main__':
     try:
         main()
