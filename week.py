@@ -60,7 +60,10 @@ def main():
     for AS in alias:
         allAlias.extend(alias[AS])
     for AS in allAlias:
-        del result[AS]
+        try:
+            del result[AS]
+        except:
+            pass
  #   print('*************************************************')
 
     for i in result:
@@ -102,9 +105,6 @@ def main():
 #    print(result6)
 
     printSorted(result, dateBgn, dateEnd)
-
-
-
 
 if __name__ == '__main__':
     try:
