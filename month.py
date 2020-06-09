@@ -60,7 +60,10 @@ def main():
     for AS in alias:
         allAlias.extend(alias[AS])
     for AS in allAlias:
-        del result[AS]
+        try:
+            del result[AS]
+        except:
+            pass
  #   print('*************************************************')
 
     for i in result:
